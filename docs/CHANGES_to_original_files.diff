@@ -1,0 +1,318 @@
+diff --git a/byterun/__main__.py b/byterun/__main__.py
+index 571c9c1..cfed6cc 100644
+--- a/byterun/__main__.py
++++ b/byterun/__main__.py
+@@ -2,6 +2,8 @@
+ 
+ import argparse
+ import logging
++import os
++import sys
+ 
+ from . import execfile
+ 
+@@ -17,8 +19,25 @@ parser.add_argument(
+     '-v', '--verbose', dest='verbose', action='store_true',
+     help="trace the execution of the bytecode.",
+ )
++# [NEW] Extra command line options added for the college project.
+ parser.add_argument(
+-    'prog',
++    '-t', '--trace', dest='trace', action='store_true',
++    help="[NEW] print one trace line per executed instruction (with the stack).",
++)
++parser.add_argument(
++    '-s', '--stats', dest='stats', action='store_true',
++    help="[NEW] print an execution summary report after the program ends.",
++)
++parser.add_argument(
++    '-l', '--limit', dest='limit', type=int, default=None, metavar='N',
++    help="[NEW] stop the program after N instructions (stops infinite loops).",
++)
++parser.add_argument(
++    '-g', '--gui', dest='gui', action='store_true',
++    help="[NEW] open the Tkinter window instead of running from the command line.",
++)
++parser.add_argument(
++    'prog', nargs='?',      # [NEW] nargs='?' so that --gui needs no program name
+     help="The program to run.",
+ )
+ parser.add_argument(
+@@ -27,6 +46,37 @@ parser.add_argument(
+ )
+ args = parser.parse_args()
+ 
++# [NEW] --gui: open the window and stop here.
++if args.gui:
++    from . import gui
++    gui.main(args.prog)
++    sys.exit(0)
++
++if args.prog is None:
++    parser.error("the following arguments are required: prog")
++
++# [NEW] Friendly message instead of a long traceback for a missing file.
++if not args.module and not os.path.isfile(args.prog):
++    sys.stderr.write("FILE ERROR: cannot find the file '%s'\n" % args.prog)
++    sys.exit(2)
++
++# [NEW] If any new option was used, run through the new runner so that we can
++# show the trace / statistics and handle errors nicely.
++if args.trace or args.stats or args.limit is not None:
++    from . import runner, report
++    result = runner.run_file(
++        args.prog, trace=args.trace, max_instructions=args.limit,
++        trace_stream=sys.stdout if args.trace else None,
++        output_stream=sys.stdout if args.trace else None,
++    )
++    if not args.trace:
++        sys.stdout.write(result.output)
++    if result.error:
++        sys.stdout.write(result.error + "\n")
++    if args.stats and result.statistics:
++        print(report.format_statistics(result.statistics))
++    sys.exit(0 if result.ok else 1)
++
+ if args.module:
+     run_fn = execfile.run_python_module
+ else:
+diff --git a/byterun/pyvm2.py b/byterun/pyvm2.py
+index 394e2e0..e724237 100644
+--- a/byterun/pyvm2.py
++++ b/byterun/pyvm2.py
+@@ -9,6 +9,8 @@ import linecache
+ import logging
+ import operator
+ import sys
++import time                                  # [NEW] for execution timing
++from collections import Counter               # [NEW] for per-opcode statistics
+ 
+ import six
+ from six.moves import reprlib
+@@ -35,6 +37,17 @@ class VirtualMachineError(Exception):
+     pass
+ 
+ 
++# [NEW] Two special errors used by the new safety features.
++class InstructionLimitExceeded(VirtualMachineError):
++    """[NEW] Raised when a program runs more instructions than allowed."""
++    pass
++
++
++class ExecutionStopped(VirtualMachineError):
++    """[NEW] Raised when the user asks the VM to stop (used by the GUI)."""
++    pass
++
++
+ class VirtualMachine(object):
+     def __init__(self):
+         # The call stack of frames.
+@@ -44,6 +57,161 @@ class VirtualMachine(object):
+         self.return_value = None
+         self.last_exception = None
+ 
++        # [NEW] Settings for the extra features (they survive reset()).
++        self.trace_enabled = False      # record one trace line per instruction
++        self.trace_stream = None        # optional file-like object for live trace
++        self.max_trace_lines = 20000    # keep memory small for long programs
++        self.max_instructions = None    # None means "no limit"
++        self.instruction_hook = None    # function(vm, name, args, offset)
++        # [NEW] Statistics and error information.
++        self.reset_statistics()
++
++    # ------------------------------------------------------------------
++    # [NEW] EXTENSION METHODS (added for the college project)
++    # ------------------------------------------------------------------
++
++    def reset_statistics(self):
++        """[NEW] Set every counter, the trace and the error info to empty."""
++        self.instruction_count = 0          # total instructions executed
++        self.opcode_counts = Counter()      # how many times each opcode ran
++        self.max_stack_depth = 0            # deepest value stack ever seen
++        self.max_call_depth = 0             # deepest nesting of frames
++        self.frames_created = 0             # number of frames (calls) run
++        self.start_time = None
++        self.end_time = None
++        self.trace_lines = []               # the recorded trace
++        self.trace_truncated = False        # True if trace hit max_trace_lines
++        self.error_info = None              # details of the first error
++
++    def reset(self):
++        """[NEW] Return the VM to a clean state so it can run a new program.
++
++        Settings (trace on/off, instruction limit, hook) are kept.
++        """
++        self.frames = []
++        self.frame = None
++        self.return_value = None
++        self.last_exception = None
++        self.reset_statistics()
++
++    def before_instruction(self, byteName, arguments, opoffset):
++        """[NEW] Called by run_frame() just BEFORE each instruction runs.
++
++        It updates the counters, writes the trace line, enforces the
++        instruction limit and calls the optional hook (used by the GUI).
++        """
++        self.instruction_count += 1
++        self.opcode_counts[byteName] += 1
++        stack_size = len(self.frame.stack)
++        if stack_size > self.max_stack_depth:
++            self.max_stack_depth = stack_size
++
++        if self.trace_enabled:
++            self.add_trace_line(byteName, arguments, opoffset)
++
++        if (self.max_instructions is not None and
++                self.instruction_count > self.max_instructions):
++            raise InstructionLimitExceeded(
++                "Program stopped: more than %d instructions were executed "
++                "(possible infinite loop)." % self.max_instructions
++            )
++
++        if self.instruction_hook is not None:
++            self.instruction_hook(self, byteName, arguments, opoffset)
++
++    def add_trace_line(self, byteName, arguments, opoffset):
++        """[NEW] Build one readable trace line and store/print it."""
++        depth = len(self.frames)
++        arg_text = ""
++        if arguments:
++            arg_text = " " + repr(arguments[0])[:40]
++        line = "#%-5d depth=%d  %4d %-20s%s   stack=%s" % (
++            self.instruction_count, depth, opoffset, byteName, arg_text,
++            self.stack_as_text(),
++        )
++        if len(self.trace_lines) < self.max_trace_lines:
++            self.trace_lines.append(line)
++        else:
++            self.trace_truncated = True
++        if self.trace_stream is not None:
++            self.trace_stream.write(line + "\n")
++
++    def stack_as_list(self):
++        """[NEW] Return the current value stack as a list of short strings.
++
++        The first item of the list is the BOTTOM of the stack.
++        """
++        if self.frame is None:
++            return []
++        return [repr(item)[:40] for item in self.frame.stack]
++
++    def stack_as_text(self):
++        """[NEW] Return the current value stack as one line like [1, 2, 'a']."""
++        return "[" + ", ".join(self.stack_as_list()) + "]"
++
++    def line_of_instruction(self, frame):
++        """[NEW] Return the source line of the instruction `frame` just fetched.
++
++        The original Frame.line_number() can be one line too high for the last
++        instruction of a line, so we look at the last byte of the instruction
++        (f_lasti - 1), which always lies inside the correct line.
++        """
++        code = frame.f_code
++        offset = frame.f_lasti - 1
++        byte_num = 0
++        line_num = code.co_firstlineno
++        increments = zip(six.iterbytes(code.co_lnotab[0::2]),
++                         six.iterbytes(code.co_lnotab[1::2]))
++        for byte_incr, line_incr in increments:
++            byte_num += byte_incr
++            if byte_num > offset:
++                break
++            line_num += line_incr
++        return line_num
++
++    def record_error(self, byteName):
++        """[NEW] Remember where the first error happened (for good messages)."""
++        value = self.last_exception[1]
++        if self.error_info is not None and self.error_info["exception"] is value:
++            return          # same error passing up through outer frames
++        frame = self.frame
++        try:
++            message = str(value)
++        except Exception:                   # some messages cannot be printed
++            message = repr(value)
++        self.error_info = {
++            "exception": value,
++            "type": self.last_exception[0].__name__,
++            "message": message,
++            "opcode": byteName,
++            "function": frame.f_code.co_name,
++            "filename": frame.f_code.co_filename,
++            "line": self.line_of_instruction(frame),
++            "stack": self.stack_as_list(),
++            "call_stack": [(f.f_code.co_name, self.line_of_instruction(f))
++                           for f in self.frames],
++        }
++
++    def get_statistics(self):
++        """[NEW] Return all execution statistics as a dictionary."""
++        elapsed = None
++        if self.start_time is not None and self.end_time is not None:
++            elapsed = self.end_time - self.start_time
++        return {
++            "instructions": self.instruction_count,
++            "unique_opcodes": len(self.opcode_counts),
++            "opcode_counts": dict(self.opcode_counts),
++            "most_common": self.opcode_counts.most_common(5),
++            "max_stack_depth": self.max_stack_depth,
++            "max_call_depth": self.max_call_depth,
++            "frames_created": self.frames_created,
++            "elapsed_seconds": elapsed,
++        }
++
++    # ------------------------------------------------------------------
++    # (original code continues below)
++    # ------------------------------------------------------------------
++
+     def top(self):
+         """Return the value at the top of the stack, with no changes."""
+         return self.frame.stack[-1]
+@@ -113,6 +281,10 @@ class VirtualMachine(object):
+     def push_frame(self, frame):
+         self.frames.append(frame)
+         self.frame = frame
++        # [NEW] statistics about calls
++        self.frames_created += 1
++        if len(self.frames) > self.max_call_depth:
++            self.max_call_depth = len(self.frames)
+ 
+     def pop_frame(self):
+         self.frames.pop()
+@@ -142,7 +314,11 @@ class VirtualMachine(object):
+ 
+     def run_code(self, code, f_globals=None, f_locals=None):
+         frame = self.make_frame(code, f_globals=f_globals, f_locals=f_locals)
+-        val = self.run_frame(frame)
++        self.start_time = time.time()           # [NEW]
++        try:                                    # [NEW]
++            val = self.run_frame(frame)
++        finally:                                # [NEW]
++            self.end_time = time.time()         # [NEW]
+         # Check some invariants
+         if self.frames:            # pragma: no cover
+             raise VirtualMachineError("Frames left over!")
+@@ -238,6 +414,7 @@ class VirtualMachine(object):
+         except:
+             # deal with exceptions encountered while executing the op.
+             self.last_exception = sys.exc_info()[:2] + (None,)
++            self.record_error(byteName)             # [NEW]
+             log.exception("Caught exception during execution")
+             why = 'exception'
+ 
+@@ -316,6 +493,7 @@ class VirtualMachine(object):
+         self.push_frame(frame)
+         while True:
+             byteName, arguments, opoffset = self.parse_byte_and_args()
++            self.before_instruction(byteName, arguments, opoffset)   # [NEW]
+             if log.isEnabledFor(logging.INFO):
+                 self.log(byteName, arguments, opoffset)
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 5d67d83..0c66e26 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1 @@
+-tox
+ six>=1.4
